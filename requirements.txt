@@ -1,0 +1,10 @@
+apache-airflow-providers-postgres
+apache-airflow-providers-amazon
+psycopg2-binary==2.9.10
+pandas
+methodtools
+minio
+sqlalchemy
+boto3
+awswrangler
+awswrangler[redshift]

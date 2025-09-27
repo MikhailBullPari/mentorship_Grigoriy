@@ -1,0 +1,159 @@
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME}
+  environment:
+    &airflow-common-env
+    AIRFLOW_COREEXECUTOR: CeleryExecutor
+    AIRFLOW_DATABASESQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres/${AIRFLOW_DB}
+    AIRFLOW_CELERYRESULT_BACKEND: db+postgresql://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres/${AIRFLOW_DB}
+    AIRFLOW_CELERYBROKER_URL: redis://:@${REDIS_HOST}:${REDIS_PORT}/0
+    AIRFLOW_CORE_ENABLE_XCOM_PICKLING: "true"
+    AIRFLOW_CORE_DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW_CORE_LOAD_EXAMPLES: "false"
+    AIRFLOW_APIAUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+    AIRFLOW__CORE__FERNET_KEY: "A1zV8Wn6JQ1L7O3uYwQ5H9xM8gT2bD3r" 
+    AIRFLOW__WEBSERVER__SECRET_KEY: "3d8e9f4b2a1746b8a9c4e2c4d5a8e1d0"
+    #AIRFLOW__CONN_EXAMPLE_CONN: http://dummy_login:dummy_pass@domen/?__extra__=%7B%7D 
+    _PIP_ADDITIONAL_REQUIREMENTS: "-r /opt/python/requirements.txt"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    # - ./logs:/opt/airflow/logs
+    # - ./plugins:/opt/airflow/plugins
+    - ./requirements.txt:/opt/python/requirements.txt
+    - ./configs/airflow.cfg:/opt/airflow/airflow.cfg
+  user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+  depends_on:
+    &airflow-common-depends-on
+    airflow-init:
+        condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  
+services:
+  postgres:
+    image: postgres:17.2
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - AIRFLOW_DB_USER=${AIRFLOW_DB_USER}
+      - AIRFLOW_DB_PASSWORD=${AIRFLOW_DB_PASSWORD}
+      - AIRFLOW_DB=${AIRFLOW_DB}
+    volumes:
+      - ./configs/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4
+    container_name: redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+    restart: always
+
+  minio:
+    image: 'bitnami/minio:latest'
+    container_name: minio
+    user: "1001"
+    ports:
+      - "9000:9000" # API
+      - "9001:9001" # Console
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./data/minio_data:/data # Uncomment to unpersist data locally
+    command: ["minio", "server", "/data", "--console-address", ":9001"]
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db upgrade && \
+        airflow users create \
+          --username ${_AIRFLOW_WWW_USER_USERNAME:-admin} \
+          --password ${_AIRFLOW_WWW_USER_PASSWORD:-admin} \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+    restart: "on-failure"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    
+      
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - 8080:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+  
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.24.0
+    container_name: statsd-exporter
+    volumes:
+      - ./configs/statsd.yaml:/home/statsd-mapping-configs.yaml
+    entrypoint: ["/bin/sh", "-c", "--"]
+    command: ["statsd_exporter --statsd.listen-udp=:9125 --web.listen-address=:9102 --log.level debug --statsd.mapping-config=/home/statsd-mapping-configs.yaml"]
+    ports:
+      - 9102:9102
+      - 9125:9125
+    expose:
+      - 9125/udp
+    restart: always
