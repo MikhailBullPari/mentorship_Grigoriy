@@ -1,6 +1,7 @@
 apache-airflow-providers-postgres
 apache-airflow-providers-amazon
 psycopg2-binary==2.9.10
+openpyxl
 pandas
 methodtools
 minio
